@@ -1,0 +1,137 @@
+name: Extract NEXORA UI checkpoint for inspection
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/extract-ui-checkpoint.yml"
+      - "NEXORA-UI-PREVIEW-ROTATING-BACKGROUNDS(2).zip"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nexora-ui-checkpoint-extraction
+  cancel-in-progress: false
+
+jobs:
+  extract-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate and extract the existing UI ZIP safely
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import hashlib
+          import zipfile
+
+          archive = Path("NEXORA-UI-PREVIEW-ROTATING-BACKGROUNDS(2).zip")
+          if not archive.is_file():
+              raise SystemExit(f"Archive not found: {archive.name}")
+
+          destination = Path("ui-checkpoint").resolve()
+          destination.mkdir(parents=True, exist_ok=True)
+          skipped = []
+          extracted = []
+          total_bytes = 0
+          max_file_bytes = 80 * 1024 * 1024
+          max_total_bytes = 500 * 1024 * 1024
+          max_files = 5000
+
+          with zipfile.ZipFile(archive) as zf:
+              bad_member = zf.testzip()
+              if bad_member:
+                  raise SystemExit(f"ZIP integrity check failed at: {bad_member}")
+
+              for info in zf.infolist():
+                  member = PurePosixPath(info.filename)
+                  if member.is_absolute() or ".." in member.parts:
+                      skipped.append(f"{info.filename} — unsafe path")
+                      continue
+                  if any(part in {".git", "node_modules"} for part in member.parts):
+                      skipped.append(f"{info.filename} — Git internals/dependencies excluded")
+                      continue
+                  if info.is_dir():
+                      (destination / Path(*member.parts)).mkdir(parents=True, exist_ok=True)
+                      continue
+                  if len(extracted) >= max_files:
+                      skipped.append(f"{info.filename} — 5,000-file safety cap reached")
+                      continue
+                  if info.file_size > max_file_bytes:
+                      skipped.append(f"{info.filename} — over 80 MiB safety limit")
+                      continue
+                  if total_bytes + info.file_size > max_total_bytes:
+                      skipped.append(f"{info.filename} — 500 MiB total extraction safety limit reached")
+                      continue
+
+                  out = (destination / Path(*member.parts)).resolve()
+                  if out != destination and destination not in out.parents:
+                      skipped.append(f"{info.filename} — unsafe resolved path")
+                      continue
+                  out.parent.mkdir(parents=True, exist_ok=True)
+                  written = 0
+                  with zf.open(info) as source, out.open("wb") as target:
+                      while True:
+                          chunk = source.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          written += len(chunk)
+                          if written > max_file_bytes:
+                              raise SystemExit(f"Expanded member exceeds safety limit: {info.filename}")
+                          target.write(chunk)
+                  total_bytes += written
+                  extracted.append((out.relative_to(destination).as_posix(), written))
+
+          if not extracted:
+              raise SystemExit("No files extracted; ZIP layout needs manual review.")
+
+          report = [
+              "# NEXORA UI checkpoint extraction report",
+              "",
+              "Generated from the existing repository ZIP. The main project files and original ZIP are preserved.",
+              "",
+              f"- Source archive: `{archive.name}`",
+              f"- Files extracted: {len(extracted)}",
+              f"- Total extracted bytes: {total_bytes:,}",
+              f"- Omitted entries: {len(skipped)}",
+              "",
+              "## Files (path, byte size, SHA-256)",
+              "",
+              "| Path | Bytes | SHA-256 |",
+              "|---|---:|---|",
+          ]
+          for rel, size in sorted(extracted):
+              digest = hashlib.sha256((destination / rel).read_bytes()).hexdigest()
+              report.append(f"| `{rel.replace('|', '%7C')}` | {size} | `{digest}` |")
+          if skipped:
+              report += ["", "## Omitted entries", ""]
+              report += [f"- `{item.replace(chr(96), chr(39))}`" for item in skipped]
+          (destination / "EXTRACTION-REPORT.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+          print(f"Extracted {len(extracted)} files ({total_bytes:,} bytes); omitted {len(skipped)} entries.")
+          PY
+
+      - name: Publish extracted files on a separate inspection branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C nexora-ui-inspection
+          git add ui-checkpoint/
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          git commit -m "Extract NEXORA UI checkpoint for inspection"
+          git push --force-with-lease origin nexora-ui-inspection
+
+      - name: Print inspection link
+        run: echo "Extracted checkpoint: https://github.com/${{ github.repository }}/tree/nexora-ui-inspection/ui-checkpoint"
